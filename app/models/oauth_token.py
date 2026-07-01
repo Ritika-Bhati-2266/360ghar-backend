@@ -9,7 +9,7 @@ from app.core.database import Base
 
 
 class OAuthToken(Base):
-    __tablename__ = "oauth_tokens"
+    __tablename__ = "mcp_oauth_tokens"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     access_token: Mapped[str] = mapped_column(

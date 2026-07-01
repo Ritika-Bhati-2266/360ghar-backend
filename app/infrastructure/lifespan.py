@@ -182,6 +182,25 @@ async def _apply_pending_migrations() -> None:
                 CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_user_id ON public.mcp_oauth_tokens(user_id);
                 """
             ),
+            (
+                "mcp_oauth_tokens: add supabase_user_id column",
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_name = 'mcp_oauth_tokens'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'mcp_oauth_tokens'
+                          AND column_name = 'supabase_user_id'
+                    ) THEN
+                        ALTER TABLE public.mcp_oauth_tokens ADD COLUMN supabase_user_id VARCHAR;
+                    END IF;
+                END $$;
+                """
+            ),
         ):
             try:
                 await conn.execute(text(sql))
