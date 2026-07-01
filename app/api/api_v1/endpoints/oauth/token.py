@@ -153,6 +153,8 @@ async def token_endpoint(
                 resource=auth_data.get("resource"),
                 access_token_expires_in=OAUTH_ACCESS_TOKEN_LIFETIME,
                 refresh_token_expires_in=OAUTH_REFRESH_TOKEN_LIFETIME,
+                supabase_user_id=auth_data.get("supabase_user_id"),
+                db=db,
             )
 
             logger.info(
@@ -186,7 +188,7 @@ async def token_endpoint(
                     },
                 )
 
-            refresh_data = await oauth_token_store.get_refresh_token(refresh_token)
+            refresh_data = await oauth_token_store.get_refresh_token(refresh_token, db=db)
             if not refresh_data:
                 raise HTTPException(
                     status_code=400,
@@ -246,8 +248,10 @@ async def token_endpoint(
                 resource=refresh_data.get("resource"),
                 access_token_expires_in=OAUTH_ACCESS_TOKEN_LIFETIME,
                 refresh_token_expires_in=OAUTH_REFRESH_TOKEN_LIFETIME,
+                supabase_user_id=refresh_data.get("supabase_user_id"),
+                db=db,
             )
-            await oauth_token_store.revoke_refresh_token(refresh_token)
+            await oauth_token_store.revoke_refresh_token(refresh_token, db=db)
 
             response = {
                 "access_token": new_access_token,
@@ -287,6 +291,7 @@ async def revoke_token(
     token: str = Form(...),
     token_type_hint: str | None = Form(None),
     client_id: str | None = Form(None),
+    db: AsyncSession = Depends(get_db),
 ):
     """RFC 7009 OAuth token revocation endpoint."""
     try:
@@ -308,7 +313,7 @@ async def revoke_token(
             return bool(client_id == token_client_id)
 
         if token_type_hint == "refresh_token":
-            refresh_data = await oauth_token_store.get_refresh_token(token)
+            refresh_data = await oauth_token_store.get_refresh_token(token, db=db)
             if not await _validate_client_binding(refresh_data):
                 raise HTTPException(
                     status_code=400,
@@ -318,11 +323,11 @@ async def revoke_token(
                     },
                 )
             if refresh_data:
-                await oauth_token_store.revoke_refresh_token(token)
+                await oauth_token_store.revoke_refresh_token(token, db=db)
             return JSONResponse(status_code=200, content={})
 
         if token_type_hint == "access_token":
-            access_data = await oauth_token_store.get_access_token(token)
+            access_data = await oauth_token_store.get_access_token(token, db=db)
             if not await _validate_client_binding(access_data):
                 raise HTTPException(
                     status_code=400,
@@ -332,11 +337,11 @@ async def revoke_token(
                     },
                 )
             if access_data:
-                await oauth_token_store.revoke_token_pair(access_token=token)
+                await oauth_token_store.revoke_token_pair(access_token=token, db=db)
             return JSONResponse(status_code=200, content={})
 
         # No hint: try both types, but keep response idempotent and opaque.
-        access_data = await oauth_token_store.get_access_token(token)
+        access_data = await oauth_token_store.get_access_token(token, db=db)
         if access_data:
             if not await _validate_client_binding(access_data):
                 raise HTTPException(
@@ -346,10 +351,10 @@ async def revoke_token(
                         "error_description": "Invalid client_id",
                     },
                 )
-            await oauth_token_store.revoke_token_pair(access_token=token)
+            await oauth_token_store.revoke_token_pair(access_token=token, db=db)
             return JSONResponse(status_code=200, content={})
 
-        refresh_data = await oauth_token_store.get_refresh_token(token)
+        refresh_data = await oauth_token_store.get_refresh_token(token, db=db)
         if refresh_data:
             if not await _validate_client_binding(refresh_data):
                 raise HTTPException(
@@ -359,7 +364,7 @@ async def revoke_token(
                         "error_description": "Invalid client_id",
                     },
                 )
-            await oauth_token_store.revoke_refresh_token(token)
+            await oauth_token_store.revoke_refresh_token(token, db=db)
 
         return JSONResponse(status_code=200, content={})
     except HTTPException:

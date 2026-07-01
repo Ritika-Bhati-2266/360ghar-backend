@@ -14,7 +14,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token as get_auth
 from app.core.database import AsyncSessionLocalBG
 from app.core.logging import get_logger
 from app.models.enums import UserRole
-from app.services.user import get_user_by_id
+from app.services.user import get_user_by_id, get_user_by_supabase_id
 
 if TYPE_CHECKING:
     from app.models.bookings import Booking
@@ -137,9 +137,20 @@ async def get_user_from_mcp_context(db) -> User | None:
     user = await get_user_by_id(db, user_id)
     if user:
         logger.info("User resolved from MCP context", extra={"user_id": user.id, "role": user.role})
-    else:
-        logger.warning("OAuth access token refers to unknown user id", extra={"user_id": user_id})
-    return user
+        return user
+
+    supabase_id = claims.get("supabase_user_id")
+    if supabase_id:
+        user = await get_user_by_supabase_id(db, supabase_id)
+        if user:
+            logger.info(
+                "User resolved via supabase_user_id fallback",
+                extra={"user_id": user.id, "supabase_user_id": supabase_id},
+            )
+            return user
+
+    logger.warning("OAuth access token refers to unknown user id", extra={"user_id": user_id})
+    return None
 
 
 def serialize_property_basic(prop: Property | PropertySchema) -> dict:

@@ -231,6 +231,7 @@ async def process_consent(
             extra={"supabase_id": supabase_user_data.get("id")},
         )
         db_user = await get_or_create_user_from_supabase(db, supabase_user_data)
+        supabase_user_id = str(db_user.supabase_user_id or supabase_user_data.get("id", ""))
 
         auth_code = generate_auth_code()
 
@@ -244,6 +245,7 @@ async def process_consent(
             code_challenge_method=oauth_session["code_challenge_method"],
             resource=oauth_session.get("resource"),
             expires_in=OAUTH_AUTHORIZATION_CODE_LIFETIME,
+            supabase_user_id=supabase_user_id,
         )
 
         await oauth_token_store.delete_session(session)

@@ -134,6 +134,54 @@ async def _apply_pending_migrations() -> None:
                 "tours: create status_visibility index",
                 "CREATE INDEX IF NOT EXISTS idx_tours_status_visibility ON public.tours(status, visibility) WHERE deleted_at IS NULL"
             ),
+            (
+                "oauth_tokens: create table",
+                """
+                CREATE TABLE IF NOT EXISTS public.oauth_tokens (
+                    id SERIAL PRIMARY KEY,
+                    access_token VARCHAR(255) NOT NULL UNIQUE,
+                    refresh_token VARCHAR(255) NOT NULL UNIQUE,
+                    user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                    supabase_user_id VARCHAR,
+                    scope VARCHAR NOT NULL,
+                    client_id VARCHAR,
+                    resource VARCHAR,
+                    token_type VARCHAR(50) DEFAULT 'Bearer',
+                    access_token_expires_at TIMESTAMPTZ NOT NULL,
+                    refresh_token_expires_at TIMESTAMPTZ NOT NULL,
+                    is_revoked BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS idx_oauth_tokens_access_token ON public.oauth_tokens(access_token);
+                CREATE INDEX IF NOT EXISTS idx_oauth_tokens_refresh_token ON public.oauth_tokens(refresh_token);
+                CREATE INDEX IF NOT EXISTS idx_oauth_tokens_user_id ON public.oauth_tokens(user_id);
+                """
+            ),
+            (
+                "mcp_oauth_tokens: create table",
+                """
+                CREATE TABLE IF NOT EXISTS public.mcp_oauth_tokens (
+                    id SERIAL PRIMARY KEY,
+                    access_token VARCHAR(255) NOT NULL UNIQUE,
+                    refresh_token VARCHAR(255) NOT NULL UNIQUE,
+                    user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                    supabase_user_id VARCHAR,
+                    scope VARCHAR NOT NULL,
+                    client_id VARCHAR,
+                    resource VARCHAR,
+                    token_type VARCHAR(50) DEFAULT 'Bearer',
+                    access_token_expires_at TIMESTAMPTZ NOT NULL,
+                    refresh_token_expires_at TIMESTAMPTZ NOT NULL,
+                    is_revoked BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_access_token ON public.mcp_oauth_tokens(access_token);
+                CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_refresh_token ON public.mcp_oauth_tokens(refresh_token);
+                CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_user_id ON public.mcp_oauth_tokens(user_id);
+                """
+            ),
         ):
             try:
                 await conn.execute(text(sql))

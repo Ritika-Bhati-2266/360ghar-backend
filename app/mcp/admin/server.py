@@ -24,8 +24,20 @@ from app.models.enums import UserRole
 
 logger = get_logger(__name__)
 
+
+def _create_admin_auth():
+    """Create the AuthProvider for the admin MCP server."""
+    from app.mcp.auth_provider import SupabaseTokenVerifier, get_public_base_url
+
+    public_base_url = get_public_base_url()
+    return SupabaseTokenVerifier(
+        required_scopes=["mcp:read", "mcp:write"],
+        expected_resource=f"{public_base_url}/mcp-admin",
+    )
+
+
 # Create the Admin MCP server instance
-admin_mcp = AppsSDKFastMCP("ghar360-admin")
+admin_mcp = AppsSDKFastMCP("ghar360-admin", auth=_create_admin_auth())
 
 
 async def _get_user(db):

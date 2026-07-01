@@ -17,8 +17,20 @@ from app.mcp.utils import get_user_from_mcp_context
 
 logger = get_logger(__name__)
 
+
+def _create_user_auth():
+    """Create the AuthProvider for the user MCP server."""
+    from app.mcp.auth_provider import SupabaseTokenVerifier, get_public_base_url
+
+    public_base_url = get_public_base_url()
+    return SupabaseTokenVerifier(
+        required_scopes=["mcp:read", "mcp:write"],
+        expected_resource=f"{public_base_url}/mcp",
+    )
+
+
 # Create the User MCP server instance
-user_mcp = AppsSDKFastMCP("ghar360-user")
+user_mcp = AppsSDKFastMCP("ghar360-user", auth=_create_user_auth())
 
 
 async def _get_user(db):

@@ -44,9 +44,19 @@ class InMemoryCacheBackend:
     - Thread-safe via asyncio.Lock
     - Automatic cleanup of expired entries
 
-    Note: This implementation is process-local and not suitable for
-    multi-process deployments. Use Redis for distributed caching.
+    Note: This implementation uses class-level shared state so all
+    instances share the same underlying cache storage.  Even if the
+    CacheManager singleton is bypassed or multiple CacheManager
+    instances are created, a single in-memory cache is used across
+    all requests.
+    Use Redis for distributed multi-process deployments.
     """
+
+    _shared_cache: OrderedDict[str, CacheEntry] | None = None
+    _shared_lock: asyncio.Lock | None = None
+    _shared_stats: CacheStats | None = None
+    _cleanup_task: asyncio.Task | None = None
+    _available: bool = False
 
     def __init__(
         self,
@@ -57,26 +67,33 @@ class InMemoryCacheBackend:
     ):
         """Initialize in-memory cache.
 
+        Uses class-level shared storage so all instances see the same data.
+        Only the first call initialises the shared OrderedDict and Lock;
+        subsequent instances reuse them.
+
         Args:
             max_size: Maximum number of entries before LRU eviction
             default_ttl: Default TTL in seconds for entries without explicit TTL
             cleanup_interval: Interval in seconds for background cleanup of expired entries
             max_entry_bytes: Maximum serialized entry size accepted into memory
         """
-        self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
-        self._lock = asyncio.Lock()
+        if InMemoryCacheBackend._shared_cache is None:
+            InMemoryCacheBackend._shared_cache = OrderedDict()
+        if InMemoryCacheBackend._shared_lock is None:
+            InMemoryCacheBackend._shared_lock = asyncio.Lock()
+        if InMemoryCacheBackend._shared_stats is None:
+            InMemoryCacheBackend._shared_stats = CacheStats()
+
         self._max_size = max_size
         self._default_ttl = default_ttl
         self._cleanup_interval = cleanup_interval
         self._max_entry_bytes = max_entry_bytes
-        self._cleanup_task: asyncio.Task | None = None
-        self._available = False
-        self.stats = CacheStats()
 
     async def connect(self) -> None:
-        """Start the background cleanup task."""
-        self._available = True
-        self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+        """Start the background cleanup task (idempotent)."""
+        InMemoryCacheBackend._available = True
+        if InMemoryCacheBackend._cleanup_task is None:
+            InMemoryCacheBackend._cleanup_task = asyncio.create_task(self._periodic_cleanup())
         logger.info(
             "In-memory cache initialized",
             extra={"max_size": self._max_size, "default_ttl": self._default_ttl},
@@ -84,20 +101,33 @@ class InMemoryCacheBackend:
 
     async def disconnect(self) -> None:
         """Stop cleanup task and clear cache."""
-        self._available = False
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
+        InMemoryCacheBackend._available = False
+        if InMemoryCacheBackend._cleanup_task:
+            InMemoryCacheBackend._cleanup_task.cancel()
             try:
-                await self._cleanup_task
+                await InMemoryCacheBackend._cleanup_task
             except asyncio.CancelledError:
                 pass
+            InMemoryCacheBackend._cleanup_task = None
         async with self._lock:
             self._cache.clear()
         logger.info("In-memory cache disconnected")
 
     def is_available(self) -> bool:
         """Check if cache is available."""
-        return self._available
+        return InMemoryCacheBackend._available
+
+    @property
+    def _cache(self) -> OrderedDict[str, CacheEntry]:
+        return InMemoryCacheBackend._shared_cache
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        return InMemoryCacheBackend._shared_lock
+
+    @property
+    def stats(self) -> CacheStats:
+        return InMemoryCacheBackend._shared_stats
 
     async def get(self, key: str) -> Any | None:
         """Get value, updating LRU order on access."""
@@ -112,7 +142,6 @@ class InMemoryCacheBackend:
                 self.stats.misses += 1
                 return None
 
-            # Move to end for LRU (most recently used)
             self._cache.move_to_end(key)
             self.stats.hits += 1
             return entry.value
@@ -120,10 +149,11 @@ class InMemoryCacheBackend:
     async def set(self, key: str, value: Any, ttl: int | None = None) -> bool:
         """Set value with optional TTL, evicting LRU if needed."""
         try:
-            if len(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)) > self._max_entry_bytes:
+            size = len(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
+            if size > self._max_entry_bytes:
                 logger.debug(
                     "In-memory cache rejected oversized value",
-                    extra={"key": key, "limit": self._max_entry_bytes},
+                    extra={"key": key, "limit": self._max_entry_bytes, "size": size},
                 )
                 return False
 
@@ -131,13 +161,10 @@ class InMemoryCacheBackend:
             expires_at = time.time() + ttl if ttl > 0 else None
 
             async with self._lock:
-                # If key exists, remove it first (will be re-added at end)
                 if key in self._cache:
                     del self._cache[key]
 
-                # Evict LRU entries if at capacity
                 while len(self._cache) >= self._max_size:
-                    # popitem(last=False) removes oldest (least recently used)
                     evicted_key, _ = self._cache.popitem(last=False)
                     logger.debug("LRU eviction: %s", evicted_key)
 
@@ -155,11 +182,7 @@ class InMemoryCacheBackend:
             return False
 
     async def get_and_delete(self, key: str) -> Any | None:
-        """Atomically get value and delete key under the same lock.
-
-        Prevents TOCTOU races where two concurrent callers both read
-        the value before either deletes it.
-        """
+        """Atomically get value and delete key under the same lock."""
         async with self._lock:
             entry = self._cache.get(key)
             if entry is None:
@@ -188,7 +211,6 @@ class InMemoryCacheBackend:
         """Delete keys matching fnmatch pattern (e.g., 'properties:*')."""
         deleted = 0
         async with self._lock:
-            # Collect keys to delete (can't modify dict during iteration)
             keys_to_delete = [
                 k for k in self._cache.keys() if fnmatch.fnmatch(k, pattern)
             ]
@@ -222,7 +244,7 @@ class InMemoryCacheBackend:
 
     async def _periodic_cleanup(self) -> None:
         """Background task to remove expired entries."""
-        while self._available:
+        while InMemoryCacheBackend._available:
             try:
                 await asyncio.sleep(self._cleanup_interval)
                 await self._cleanup_expired()

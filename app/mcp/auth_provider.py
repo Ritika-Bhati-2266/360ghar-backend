@@ -70,10 +70,12 @@ class SupabaseTokenVerifier(TokenVerifier):
         try:
             # Our OAuth access tokens are long, random strings without dots
             if len(token) > 40 and "." not in token:
+                from app.core.database import AsyncSessionLocal
                 from app.services.oauth_token_store import oauth_token_store
 
-                logger.debug("Looking up token in OAuth store")
-                token_data = await oauth_token_store.get_access_token(token)
+                logger.debug("Looking up token in OAuth store (DB)")
+                async with AsyncSessionLocal() as db:
+                    token_data = await oauth_token_store.get_access_token(token, db=db)
                 if token_data:
                     user_id = token_data["user_id"]
                     expires_at_raw = token_data.get("expires_at")
@@ -112,6 +114,7 @@ class SupabaseTokenVerifier(TokenVerifier):
                         "auth_method": "oauth",
                         "scope": token_data.get("scope", "mcp:read mcp:write"),
                         "resource": token_resource,
+                        "supabase_user_id": token_data.get("supabase_user_id"),
                     }
 
                     if "email" in token_data:

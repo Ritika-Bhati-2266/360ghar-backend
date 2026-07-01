@@ -11,24 +11,6 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 
-def _optional_auth_middleware(expected_resources: list[str]) -> list[Any]:
-    from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
-    from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
-    from starlette.middleware import Middleware
-    from starlette.middleware.authentication import AuthenticationMiddleware
-
-    from app.mcp.auth_provider import SupabaseTokenVerifier
-
-    token_verifier = SupabaseTokenVerifier(
-        required_scopes=["mcp:read", "mcp:write"],
-        expected_resources=expected_resources,
-    )
-    return [
-        Middleware(AuthenticationMiddleware, backend=BearerAuthBackend(token_verifier)),
-        Middleware(AuthContextMiddleware),
-    ]
-
-
 class LazyMCPHTTPApp:
     """ASGI proxy that builds the concrete MCP app on first request."""
 
@@ -83,7 +65,6 @@ def _build_mcp_http_app(server_name: str) -> Any:
     from starlette.middleware import Middleware
 
     from app.mcp.admin import admin_mcp
-    from app.mcp.auth_provider import get_public_base_url
     from app.mcp.chatgpt import register_chatgpt_widgets
     from app.mcp.user import user_mcp
     from app.middleware.security import RequestLoggingMiddleware
@@ -98,8 +79,6 @@ def _build_mcp_http_app(server_name: str) -> Any:
     register_chatgpt_widgets(mcp_server)
     logger.debug("ChatGPT widgets registered", extra={"server": server_name})
 
-    public_base_url = get_public_base_url()
-    optional_auth_middleware = _optional_auth_middleware([f"{public_base_url}{mount_prefix}"])
     mcp_app = mcp_server.http_app(
         path="/",
         transport="http",
@@ -107,7 +86,6 @@ def _build_mcp_http_app(server_name: str) -> Any:
         stateless_http=True,
         middleware=[
             Middleware(RequestLoggingMiddleware, prefix=mount_prefix),
-            *optional_auth_middleware,
         ],
     )
     logger.debug("MCP HTTP app created", extra={"server": server_name})

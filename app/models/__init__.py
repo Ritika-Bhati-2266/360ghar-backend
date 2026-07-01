@@ -89,6 +89,7 @@ from .social import (
     UserMatch,
     UserReport,
 )
+from .oauth_token import OAuthToken
 from .tours import (
     AIJob,
     CacheEntry,
@@ -109,6 +110,7 @@ from .users import User, UserSearchHistory, UserSwipe
 
 __all__ = [
     # Users
+    "OAuthToken",
     "User",
     "UserSearchHistory",
     "UserSwipe",

@@ -1,22 +1,30 @@
 """
 OAuth Token Store Service
 
-Manages OAuth tokens, authorization codes, and sessions
-using the centralized CacheManager for all storage operations.
+Manages OAuth tokens, authorization codes, and sessions.
+
+- Access & refresh tokens are stored in PostgreSQL for persistence
+  across server restarts (solves the cache-reset problem).
+- Authorization codes and OAuth sessions are kept in cache
+  (short-lived, ephemeral).
+- Client registrations are kept in cache.
 """
 
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.cache import get_cache_manager
+from app.core.database import AsyncSessionLocal
 from app.core.logging import get_logger
+from app.models.oauth_token import OAuthToken
 
 logger = get_logger(__name__)
-
-MAX_USER_TOKEN_REFERENCES = 10
-USER_TOKEN_REFERENCE_TTL_SECONDS = 24 * 60 * 60
 
 
 class OAuthStorageError(Exception):
@@ -25,12 +33,11 @@ class OAuthStorageError(Exception):
 
 
 class OAuthTokenStore:
-    """OAuth token store delegating to the app-wide CacheManager.
+    """OAuth token store.
 
-    All storage operations (Redis / in-memory / null) are handled by
-    CacheManager's backend selection and fallback chain.  This class
-    only provides OAuth-specific key conventions and consume-on-read
-    semantics for auth codes.
+    Tokens (access & refresh) are persisted in PostgreSQL via the
+    ``oauth_tokens`` table so they survive server restarts.  Auth codes,
+    sessions, and client registrations use the cache (short-lived).
     """
 
     @staticmethod
@@ -38,7 +45,6 @@ class OAuthTokenStore:
         return f"oauth:{prefix}:{identifier}"
 
     def _ensure_cache_available(self) -> None:
-        """Ensure cache backend is not NullCacheBackend for security-critical operations."""
         from app.core.cache.manager import NullCacheBackend
 
         cache = get_cache_manager()
@@ -48,8 +54,19 @@ class OAuthTokenStore:
                 "configure Redis or in-memory cache for production"
             )
 
+    async def _get_db(self, db: AsyncSession | None = None) -> AsyncSession:
+        """Return provided session or create a new one."""
+        if db is not None:
+            return db
+        return AsyncSessionLocal()
+
+    async def _close_db(self, db: AsyncSession, owned: bool) -> None:
+        """Close session if we created it."""
+        if owned:
+            await db.close()
+
     # ------------------------------------------------------------------
-    # Authorization Codes
+    # Authorization Codes  (cache — short-lived, ephemeral)
     # ------------------------------------------------------------------
 
     async def store_auth_code(
@@ -63,12 +80,14 @@ class OAuthTokenStore:
         code_challenge_method: str | None = None,
         resource: str | None = None,
         expires_in: int = 600,
+        supabase_user_id: str | None = None,
     ) -> bool:
         self._ensure_cache_available()
         try:
             cache = get_cache_manager()
             data = {
                 "user_id": user_id,
+                "supabase_user_id": supabase_user_id,
                 "client_id": client_id,
                 "redirect_uri": redirect_uri,
                 "scope": scope,
@@ -94,16 +113,12 @@ class OAuthTokenStore:
             if data is None:
                 logger.debug("Auth code not found or already consumed")
                 return None
-            # Check if expired (belt-and-suspenders for in-memory backend)
             if time.time() > data.get("expires_at", 0):
                 logger.debug("Auth code expired")
                 return None
             logger.debug("Auth code retrieved and consumed", extra={"user_id": data.get("user_id")})
             return dict[str, Any](data)
         except Exception as e:
-            # Surface infrastructure failures (e.g. cache backend down) instead of
-            # returning None, which the token endpoint would misreport as
-            # invalid_grant and hide outages from operators.
             logger.error("Failed to get auth code: %s", e)
             raise OAuthStorageError(f"Failed to get auth code: {e}") from e
 
@@ -117,7 +132,7 @@ class OAuthTokenStore:
             return False
 
     # ------------------------------------------------------------------
-    # Access & Refresh Tokens
+    # Access & Refresh Tokens  (PostgreSQL — persistent across restarts)
     # ------------------------------------------------------------------
 
     async def store_oauth_tokens(
@@ -130,144 +145,267 @@ class OAuthTokenStore:
         resource: str | None = None,
         access_token_expires_in: int = 3600,
         refresh_token_expires_in: int = 2592000,
+        supabase_user_id: str | None = None,
+        db: AsyncSession | None = None,
     ) -> bool:
-        self._ensure_cache_available()
+        """Store a new OAuth token pair in PostgreSQL.
+
+        Optional ``db`` parameter lets callers reuse an existing session;
+        otherwise one is created and closed automatically.
+        """
+        owned = db is None
+        session = await self._get_db(db)
         try:
-            cache = get_cache_manager()
-            now = time.time()
+            now = datetime.now(timezone.utc)
+            token_row = OAuthToken(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                user_id=int(user_id),
+                supabase_user_id=supabase_user_id,
+                scope=scope,
+                client_id=client_id,
+                resource=resource,
+                token_type="Bearer",
+                access_token_expires_at=now + timedelta(seconds=access_token_expires_in),
+                refresh_token_expires_at=now + timedelta(seconds=refresh_token_expires_in),
+                is_revoked=False,
+            )
 
-            access_data = {
-                "user_id": user_id,
-                "scope": scope,
-                "client_id": client_id,
-                "resource": resource,
-                "token_type": "Bearer",
-                "created_at": now,
-                "expires_at": now + access_token_expires_in,
-                "refresh_token": refresh_token,
-            }
-            refresh_data = {
-                "user_id": user_id,
-                "scope": scope,
-                "client_id": client_id,
-                "resource": resource,
-                "created_at": now,
-                "expires_at": now + refresh_token_expires_in,
-                "access_token": access_token,
-            }
+            session.add(token_row)
+            await session.commit()
 
-            await cache.set(self._key("access_token", access_token), access_data, ttl=access_token_expires_in)
-            await cache.set(self._key("refresh_token", refresh_token), refresh_data, ttl=refresh_token_expires_in)
-
-            # Store user's tokens for lookup
-            user_tokens_key = self._key("user_tokens", user_id)
-            existing: list = await cache.get(user_tokens_key) or []
-            cutoff = now - USER_TOKEN_REFERENCE_TTL_SECONDS
-            existing = [
-                token
-                for token in existing
-                if token.get("created_at", 0) > cutoff
-            ][-MAX_USER_TOKEN_REFERENCES:]
-            existing.append({
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "client_id": client_id,
-                "created_at": now,
-            })
-            existing = existing[-MAX_USER_TOKEN_REFERENCES:]
-            await cache.set(user_tokens_key, existing, ttl=refresh_token_expires_in)
-
-            logger.debug("Stored OAuth tokens for user %s", user_id)
+            logger.debug("Stored OAuth tokens in DB for user %s", user_id)
             return True
         except Exception as e:
-            logger.error("Failed to store OAuth tokens: %s", e)
+            await session.rollback()
+            logger.error("Failed to store OAuth tokens in DB: %s", e)
             raise OAuthStorageError(f"Failed to store OAuth tokens: {e}") from e
+        finally:
+            await self._close_db(session, owned)
 
-    async def get_access_token(self, access_token: str) -> dict[str, Any] | None:
+    async def get_access_token(
+        self,
+        access_token: str,
+        db: AsyncSession | None = None,
+    ) -> dict[str, Any] | None:
+        """Look up an access token in PostgreSQL.
+
+        Optional ``db`` parameter lets callers reuse an existing session.
+        """
+        owned = db is None
+        session = await self._get_db(db)
         try:
-            cache = get_cache_manager()
-            data = await cache.get(self._key("access_token", access_token))
-            if data is None:
-                logger.debug("Access token not found")
+            now = datetime.now(timezone.utc)
+            result = await session.execute(
+                select(OAuthToken).where(
+                    OAuthToken.access_token == access_token,
+                    OAuthToken.is_revoked == False,  # noqa: E712
+                    OAuthToken.access_token_expires_at > now,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                logger.debug("Access token not found in DB")
                 return None
-            # Belt-and-suspenders expiry check
-            if time.time() > data.get("expires_at", 0):
-                await cache.delete(self._key("access_token", access_token))
-                logger.debug("Access token expired")
-                return None
-            logger.debug("Access token found", extra={"user_id": data.get("user_id")})
-            return dict[str, Any](data)
+
+            logger.debug("Access token found in DB", extra={"user_id": row.user_id})
+            return {
+                "user_id": str(row.user_id),
+                "supabase_user_id": row.supabase_user_id,
+                "scope": row.scope,
+                "client_id": row.client_id,
+                "resource": row.resource,
+                "token_type": row.token_type,
+                "created_at": row.created_at.timestamp() if row.created_at else 0,
+                "expires_at": row.access_token_expires_at.timestamp(),
+                "refresh_token": row.refresh_token,
+            }
         except Exception as e:
-            logger.error("Failed to get access token: %s", e)
+            logger.error("Failed to get access token from DB: %s", e)
             return None
+        finally:
+            await self._close_db(session, owned)
 
-    async def get_refresh_token(self, refresh_token: str) -> dict[str, Any] | None:
+    async def get_refresh_token(
+        self,
+        refresh_token: str,
+        db: AsyncSession | None = None,
+    ) -> dict[str, Any] | None:
+        """Look up a refresh token in PostgreSQL."""
+        owned = db is None
+        session = await self._get_db(db)
         try:
-            cache = get_cache_manager()
-            data = await cache.get(self._key("refresh_token", refresh_token))
-            if data is None:
+            now = datetime.now(timezone.utc)
+            result = await session.execute(
+                select(OAuthToken).where(
+                    OAuthToken.refresh_token == refresh_token,
+                    OAuthToken.is_revoked == False,  # noqa: E712
+                    OAuthToken.refresh_token_expires_at > now,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
                 return None
-            if time.time() > data.get("expires_at", 0):
-                await cache.delete(self._key("refresh_token", refresh_token))
-                return None
-            return dict[str, Any](data)
+
+            return {
+                "user_id": str(row.user_id),
+                "supabase_user_id": row.supabase_user_id,
+                "scope": row.scope,
+                "client_id": row.client_id,
+                "resource": row.resource,
+                "created_at": row.created_at.timestamp() if row.created_at else 0,
+                "expires_at": row.refresh_token_expires_at.timestamp(),
+                "access_token": row.access_token,
+            }
         except Exception as e:
-            logger.error("Failed to get refresh token: %s", e)
+            logger.error("Failed to get refresh token from DB: %s", e)
             return None
+        finally:
+            await self._close_db(session, owned)
 
-    async def revoke_token(self, token: str) -> bool:
+    async def revoke_token(
+        self,
+        token: str,
+        db: AsyncSession | None = None,
+    ) -> bool:
+        """Mark an access token as revoked in PostgreSQL."""
+        owned = db is None
+        session = await self._get_db(db)
         try:
-            cache = get_cache_manager()
-            await cache.delete(self._key("access_token", token))
-            logger.debug("Revoked access token")
+            result = await session.execute(
+                select(OAuthToken).where(
+                    OAuthToken.access_token == token,
+                    OAuthToken.is_revoked == False,  # noqa: E712
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row:
+                row.is_revoked = True
+                await session.commit()
+                logger.debug("Revoked access token")
             return True
         except Exception as e:
-            logger.error("Failed to revoke token: %s", e)
+            await session.rollback()
+            logger.error("Failed to revoke access token: %s", e)
             return False
+        finally:
+            await self._close_db(session, owned)
 
-    async def delete_refresh_token(self, refresh_token: str) -> bool:
+    async def delete_refresh_token(
+        self,
+        refresh_token: str,
+        db: AsyncSession | None = None,
+    ) -> bool:
+        """Mark a refresh token as revoked in PostgreSQL."""
+        owned = db is None
+        session = await self._get_db(db)
         try:
-            cache = get_cache_manager()
-            await cache.delete(self._key("refresh_token", refresh_token))
+            result = await session.execute(
+                select(OAuthToken).where(
+                    OAuthToken.refresh_token == refresh_token,
+                    OAuthToken.is_revoked == False,  # noqa: E712
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row:
+                row.is_revoked = True
+                await session.commit()
             return True
         except Exception as e:
+            await session.rollback()
             logger.error("Failed to delete refresh token: %s", e)
             return False
+        finally:
+            await self._close_db(session, owned)
 
-    async def revoke_refresh_token(self, refresh_token: str) -> bool:
+    async def revoke_refresh_token(
+        self,
+        refresh_token: str,
+        db: AsyncSession | None = None,
+    ) -> bool:
+        """Revoke a refresh token and its paired access token."""
+        owned = db is None
+        session = await self._get_db(db)
         try:
-            refresh_data = await self.get_refresh_token(refresh_token)
-            if refresh_data and refresh_data.get("access_token"):
-                await self.revoke_token(refresh_data["access_token"])
-            await self.delete_refresh_token(refresh_token)
+            result = await session.execute(
+                select(OAuthToken).where(
+                    OAuthToken.refresh_token == refresh_token,
+                    OAuthToken.is_revoked == False,  # noqa: E712
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row:
+                row.is_revoked = True
+                # Also find and revoke the paired token if stored separately
+                paired = await session.execute(
+                    select(OAuthToken).where(
+                        OAuthToken.access_token == row.access_token,
+                        OAuthToken.is_revoked == False,  # noqa: E712
+                    )
+                )
+                paired_row = paired.scalar_one_or_none()
+                if paired_row and paired_row.id != row.id:
+                    paired_row.is_revoked = True
+                await session.commit()
             return True
         except Exception as e:
+            await session.rollback()
             logger.error("Failed to revoke refresh token: %s", e)
             return False
+        finally:
+            await self._close_db(session, owned)
 
     async def revoke_token_pair(
         self,
         *,
         access_token: str | None = None,
         refresh_token: str | None = None,
+        db: AsyncSession | None = None,
     ) -> bool:
+        """Revoke both access and refresh tokens by either token value."""
+        owned = db is None
+        session = await self._get_db(db)
         try:
-            if refresh_token:
-                refresh_data = await self.get_refresh_token(refresh_token)
-                if refresh_data and refresh_data.get("access_token"):
-                    await self.revoke_token(refresh_data["access_token"])
-                await self.delete_refresh_token(refresh_token)
-
             if access_token:
-                access_data = await self.get_access_token(access_token)
-                if access_data and access_data.get("refresh_token"):
-                    await self.delete_refresh_token(access_data["refresh_token"])
-                await self.revoke_token(access_token)
+                result = await session.execute(
+                    select(OAuthToken).where(
+                        OAuthToken.access_token == access_token,
+                        OAuthToken.is_revoked == False,  # noqa: E712
+                    )
+                )
+                row = result.scalar_one_or_none()
+                if row:
+                    row.is_revoked = True
+                    # Also revoke any paired row by refresh token
+                    paired = await session.execute(
+                        select(OAuthToken).where(
+                            OAuthToken.refresh_token == row.refresh_token,
+                            OAuthToken.is_revoked == False,  # noqa: E712
+                        )
+                    )
+                    for pr in paired.scalars().all():
+                        if pr.id != row.id:
+                            pr.is_revoked = True
 
+            if refresh_token:
+                result = await session.execute(
+                    select(OAuthToken).where(
+                        OAuthToken.refresh_token == refresh_token,
+                        OAuthToken.is_revoked == False,  # noqa: E712
+                    )
+                )
+                row = result.scalar_one_or_none()
+                if row:
+                    row.is_revoked = True
+
+            await session.commit()
             return True
         except Exception as e:
+            await session.rollback()
             logger.error("Failed to revoke token pair: %s", e)
             return False
+        finally:
+            await self._close_db(session, owned)
 
     # ------------------------------------------------------------------
     # OAuth Sessions
